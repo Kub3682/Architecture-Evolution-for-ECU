@@ -10,6 +10,14 @@
     任务切换必须高效，C 语言无法直接操作寄存器，因此需要 汇编。
     调度策略
         采用 简单的轮询调度（Round-Robin）：任务按顺序执行，每次调用 switch_context() 切换到下一个任务。
+    时间轴            | 栈状态                     | 执行流
+-----------------------------------------------------------------
+main()初始化后         | [main栈][task1栈][task2栈] | 执行main的while循环
+第一次switch_context   | 保存main栈 → 加载task1栈 | 跳转到task1()
+task1运行             | [main栈][task1栈][task2栈] | 执行task1代码
+task1调用switch_context | 保存task1栈 → 加载task2栈 | 跳转到task2()
+task2运行              | [main栈][task1栈][task2栈] | 执行task2代码
+...循环往复...
 
 这段代码并不是真正的 RTOS，因为它没有实现“实时性”要求。
     任务没有“在规定的时间运行”
@@ -21,7 +29,10 @@
 
 一个简单的基于任务切换的调度器（简单的协作式多任务调度），它模仿了一个最基础的RTOS（实时操作系统，极简版的操作系统）的任务管理机制，
 允许多个任务（task）通过上下文切换（context switch）来执行。代码中涉及结构体、函数指针、内联汇编、内存分配和上下文切换等概念
-设计有栈管理、任务调度
+设计有栈管理、任务调度。
+这段代码的主要目标是实现一个非常基础的协作式任务调度器，并通过上下文切换来模拟多任务并发。其核心特点在于：
+    稳定性：通过任务结构体、栈管理和上下文切换机制，确保任务能够正确保存和恢复。
+    灵活性：通过任务创建接口、函数指针和可替换的调度策略，保证系统在未来能够适应更多的任务和复杂的调度需求。
 
 switch_context() 必须使用汇编，因为：
     需要直接操作 CPU 寄存器（SP、LR）。
@@ -47,6 +58,9 @@ switch_context() 必须使用汇编，因为：
     使用定时器中断（比如SysTick 定时器）。
     任务不需要主动调用 switch_context()，而是定时器中断会打断任务，自动切换任务。
 
+抢占式调度：像被闹钟强行打断当前工作
+协作式调度：像使用番茄工作法，每个25分钟主动休息切换任务
+
 */
 
 #include <stdint.h>  // 定义标准整数类型，如 uint32_t(无符号 32 位整数（unsigned int）), uint8_t
@@ -56,7 +70,7 @@ switch_context() 必须使用汇编，因为：
 #define MAX_TASKS 10 // 定义最大任务数,即调度器最多能管理 10 个任务。
 #define STACK_SIZE 256 // 定义每个任务栈的大小（单位：字节）假设每个任务的栈有 256 字节
 
-//定义任务结构体,表示一个任务，每个任务有两个主要属性
+//定义任务结构体,表示一个任务对象，每个任务有两个主要属性
 typedef struct Task
 {
     uint32_t *stackPointer; // 指向任务栈的指针
@@ -81,7 +95,7 @@ bool create_task(void (*task_func)(void)) {  //task_func 是一个指针变量�
 
     // 为新任务设置初始栈植
     *(tasks[taskCount].stackPointer) = (uint32_t)(task_func); // 程序计数器（PC）指针指向任务函数
-    *(--tasks[taskCount].stackPointer) = 0xFFFFFFF0; // xPSR（程序状态寄存器）默认值 0xFFFFFFF0（用于 Cortex-M 处理器，这是ARM Cortex-M的伪代码）
+    *(--tasks[taskCount].stackPointer) = 0xFFFFFFF0; // xPSR（Program Status Register程序状态寄存器）默认值 0xFFFFFFF0（用于 Cortex-M 处理器，这是ARM Cortex-M的伪代码）
 
     taskCount++; // 增加当前任务数量
     return true;
@@ -96,6 +110,8 @@ void scheduler(void){
 }
 
 // 上下文切换函数
+//一般寄存器（R0 - R12），这些寄存器用于存储任务的局部变量、函数参数、临时数据等。当任务切换时，当前任务的寄存器值需要被保存到栈中，以便任务恢复时能够继续使用正确的值。
+//链接寄存器（LR，Link Register），链接寄存器用于保存函数返回地址。当函数调用时，LR 保存函数返回的地址。任务栈会保存链接寄存器的值，以便任务执行完一个函数后能够正确地返回。
 void switch_context(void){
     __asm volatile(
         "PUSH {R0-R3, R12} \n"  // 保存寄存器
@@ -114,10 +130,20 @@ void switch_context(void){
 }
 
 // 示例任务1
+/* 
+第一次执行时：
+任务1从头开始执行逻辑1，执行到switch_context()时挂起。
+然后会调度到其他任务（比如任务2）。
+任务1重新调度回来时：
+任务1恢复执行，上次中断的位置是switch_context()后的代码，即执行逻辑2。
+所以，任务1的逻辑2会在任务1再次被调度回来时继续执行。
+任务1的**逻辑1和逻辑2都会被执行**，只是它们的执行过程被调度器分割成多个片段（每次切换任务时保存当前执行状态）。
+*/
 void task1(void){
     while(1){
-        // 此处编写任务1的代码。。。
+        // 此处编写任务1的代码逻辑1
         switch_context(); // 切换上下文到下一个任务，主动让出工作台（协作式调度，任务主动让出CPU（对比抢占式需要定时器中断））
+        // 此处编写任务1的代码逻辑2
     }
 }
 
@@ -140,3 +166,76 @@ int main(void){
     return 0;
     
 }
+
+
+/*
+从设计角度来说，函数的命名应该能够准确地反映其核心功能，而不应该让人产生混淆。
+switch_context() 这个名字的确更侧重于具体的上下文切换操作，而整个轮询调度的核心功能其实是任务调度。
+如果将 main() 函数命名为 switch_context()，确实可能给人误导，容易让人认为这个函数的主要目标是上下文切换，而不是任务调度。
+为了让代码更具可读性和直观性，可以考虑将任务调度的核心函数命名为更清晰的名称，
+例如task_scheduler()，这样人们一眼就能看出它的主要功能是轮询任务调度而不仅仅是上下文切换。
+
+另外，将 scheduler(void) 改名为 scheduler_strategy(void)，则能够更明确地传达出它是一个策略选择的函数，
+适用于将来可能进行的不同调度策略（比如优先级调度、时间片调度等）的切换。
+
+设计层面优化
+（1）分离任务管理与调度策略
+当前 scheduler() 直接对 currentTask 进行简单的递增轮询，这在目前只有两个任务时没有问题，但如果要引入优先级调度、时间片轮转或任务动态创建/删除，那么调度策略需要更灵活。
+
+改进建议：
+
+采用独立的调度策略模块，使用函数指针方式，使 task_scheduler() 只负责调用 scheduler_strategy()，而 scheduler_strategy() 由用户可配置：
+
+typedef uint8_t (*scheduler_strategy_t)(void);
+static scheduler_strategy_t scheduler_strategy = round_robin_scheduler;
+
+允许更换调度策略，例如：
+round_robin_scheduler() （轮询）
+priority_scheduler() （基于优先级）
+time_slice_scheduler() （时间片调度）
+event_driven_scheduler() （基于事件）
+
+比如：
+
+void priority_scheduler(void) {
+    uint8_t highestPriority = 255;
+    uint8_t nextTask = currentTask;
+
+    for (uint8_t i = 0; i < taskCount; i++) {
+        if (tasks[i].state == TASK_READY && tasks[i].priority < highestPriority) {
+            highestPriority = tasks[i].priority;
+            nextTask = i;
+        }
+    }
+
+    currentTask = nextTask;
+}
+
+void time_slice_scheduler(void) {
+    static uint32_t tick_count = 0;
+    tick_count++;
+    
+    if (tasks[currentTask].timeSlice == 0 || tick_count % tasks[currentTask].timeSlice == 0) {
+        do {
+            currentTask = (currentTask + 1) % taskCount;
+        } while (tasks[currentTask].state != TASK_READY);
+    }
+}
+
+
+（2）增加任务控制块（TCB）
+当前的 Task 结构体仅存储栈指针，但真实 RTOS 需要存储更多任务信息（如任务状态、优先级、时间片等）。
+优化 Task 结构体：
+
+typedef enum {TASK_READY, TASK_RUNNING, TASK_BLOCKED, TASK_SUSPENDED} TaskState;
+typedef struct {
+    uint32_t *stackPointer; // 任务栈指针
+    uint32_t *stackBase;    // 任务栈基地址
+    TaskState state;        // 任务状态
+    uint8_t priority;       // 任务优先级（用于优先级调度）
+    uint32_t timeSlice;     // 时间片（用于时间片调度）
+} Task;
+
+
+
+*/
