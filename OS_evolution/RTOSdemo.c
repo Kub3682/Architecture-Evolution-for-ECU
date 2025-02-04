@@ -1,26 +1,29 @@
-#include <stdint.h>
-#include <stdbool.h>
-#include <stdlib.h>
+/*一个简单的基于任务切换的调度器，它模仿了一个最基础的RTOS（实时操作系统）的任务管理机制，
+允许多个任务（task）通过上下文切换（context switch）来执行。设计有栈管理、任务调度、汇编上下文切换、函数指针*/
 
-#define MAX_TASKS 10 // 定义最大任务数
-#define STACK_SIZE 256 // 定义每个任务栈的大小
+#include <stdint.h>  // 定义标准整数类型，如 uint32_t(无符号 32 位整数（unsigned int）), uint8_t
+#include <stdbool.h> // 定义 bool 类型（true/false代替 1 和 0）
+#include <stdlib.h> // 提供 malloc() 动态内存分配函数
 
-//定义任务结构体
+#define MAX_TASKS 10 // 定义最大任务数,即调度器最多能管理 10 个任务。
+#define STACK_SIZE 256 // 定义每个任务栈的大小（单位：字节）假设每个任务的栈有 256 字节
+
+//定义任务结构体,表示一个任务，每个任务有两个主要属性
 typedef struct Task
 {
-    unint32_t *stackPointer; // 指向任务栈的指针
-    unint32_t *stackBase; // 任务栈的基地址
+    uint32_t *stackPointer; // 指向任务栈的指针
+    uint32_t *stackBase; // 任务栈的基地址
 };
 
-static Task tasks[MAX_TASKS]; // 定义任务数组
-static uint8_t currentTask = 0; // 当前任务索引
-static uint8_t taskCount = 0; // 当前任务数量
+static Task tasks[MAX_TASKS]; // 定义任务数组,用数组存储所有的任务信息，每个任务对应一个 Task 结构体
+static uint8_t currentTask = 0; // 当前正在运行的任务索引（任务编号）
+static uint8_t taskCount = 0; // 当前总共有多少个任务被创建
 
 // 函数原型
 void scheduler(void);
 void switch_context(void);
 
-// 初始化一个任务
+// 初始化一个任务,void (*task_func)(void)：函数指针，指向任务的入口函数（即任务执行的代码）
 bool create_task(void (*task_func)(void)) {
     if(taskCount >= MAX_TASKS) return false; // 检查是否超过最大任务数
 
@@ -30,7 +33,7 @@ bool create_task(void (*task_func)(void)) {
 
     // 为新任务设置初始栈植
     *(tasks[taskCount].stackPointer) = (uint32_t)(task_func); // 程序计数器（PC）
-    *(--tasks[taskCount].stackPointer) = 0xFFFFFFF0; // xPSR (默认值)
+    *(--tasks[taskCount].stackPointer) = 0xFFFFFFF0; // xPSR（程序状态寄存器）默认值 0xFFFFFFF0（用于 Cortex-M 处理器）
 
     taskCount++; // 增加当前任务数量
     return true;
@@ -78,7 +81,7 @@ void task2(void){
     }
 }
 
-// 启动RTOS的主函数
+// 启动RTOS的主函数,创建两个任务,无限循环，不断进行任务切换
 int main(void){
     create_task(task1); // 创建第一个任务
     create_task(task2); // 创建第二个任务
