@@ -93,10 +93,33 @@ for(time = 0; time < T; time++) {
 - Delay：到期点之间的tick数，等于后一个到期点的偏移量减去前一个到期点到期点的偏移量。如果是重复调度表，那么当前轮次最后一个到期点与下一轮第一个到期点的delay等于Final delay加上Initial Offset。
 - timer：用于时间触发的定时器
 
+仿真器中利用timerfd为调度表提供时钟，具体结构设计如下
+```
+struct ScheduleTables {
+    int initial_offset;
+    int duration;
+    int final_delay;
+    int current_delay;
+    int period;
+    int fd;                     // time fd
+    struct EntryPoint ep[MAX_NUM_EP];
+};
+```
+
 #### 到期点的结构
 - 所管理的周期任务集合：以优先级排序的顺序结构，管理的是代表任务的结构，可以是任务控制块等（可为空）
 - 所管理的事件任务集合（可为空）。
 - 从调度表起始点开始的Tick偏移量
+
+```
+struct EntryPoint {
+    int offset;
+    int task_num;
+    int event_task_num;
+    Task task[MAX_NUM_TASK];
+    Task event_task[MAX_NUM_TASK];
+};
+```
   
 #### 到期点的约束
 - 所定义的到期点不能为空，即到期点必须至少要有1个周期任务或1个事件任务。且必须确保调度表上的到期点总是有序的，该顺序由强制要求每个到期点必须由唯一的偏移量所维护，并且必须告知OS。[SWS_Os_00407]
