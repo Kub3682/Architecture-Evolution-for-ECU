@@ -79,7 +79,7 @@ int NumExpiryPoint = 0;
 T = lcm(t_1,t_2,...,t_n);
 for(time = 0; time < T; time++) {
     for(int i = 1; i <= n; i++) {
-        if(time % i == 0) {
+        if(time % t_i == 0) {
             ep[NumExpiryPoint++].offset = time;
         }
     }
