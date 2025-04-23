@@ -23,7 +23,7 @@ static struct task_struct *create_tasks_random(int cpu, int num_task)
         tasks[i].is_preempted = 0;
         tasks[i].task_type = rand()%2;
         tasks[i].task_state = SUSPENDED;
-        tasks[i].task_function = test_task;
+        tasks[i].pfunc = test_task;
     }
 
     return tasks;

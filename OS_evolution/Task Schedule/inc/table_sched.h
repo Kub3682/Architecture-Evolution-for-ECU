@@ -40,14 +40,14 @@ struct periodic_task_info {
 struct expiry_point {
     int offset;
     struct periodic_task_info *task_info;
-};
+}; 
 
 struct schedule_table {
     int initial_offset;
     int duration;
     int final_delay;
     int num_eps;
-    int current_ep_index;
+    int next_ep_index;
     int num_task_infos;
     int merge_eps_num;
     int timerfd;

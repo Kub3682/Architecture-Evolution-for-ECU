@@ -36,17 +36,30 @@ enum schedule_strategy_t {
     NUM_SCHED_STRATEGY,
 };
 
+typedef void (*task_function)(void);
+
+struct task_info {
+    int priority;
+    int cpu;
+    int period;
+    int table_id;
+    enum task_type_t task_type;
+};
+
 struct task_struct {
     pthread_t tid;
-    pthread_t scheduler_tid;
     int priority;
     int cpu;
     int period;
     int is_preempted;
+    int table_id;
     enum task_type_t task_type;
     enum task_state_t task_state;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond_var;
+    struct list_head list;
     struct scheduler *sched;
-    void (*task_function)(void);
+    task_function pfunc;
 };
 
 struct scheduler {
@@ -58,8 +71,8 @@ struct scheduler {
     struct task_struct *current_task;
     struct sched_class	*sched_class;
     struct task_struct *tasks;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond_var;
+//    pthread_mutex_t mutex;
+//    pthread_cond_t cond_var;
 }; 
 
 struct sched_class {
@@ -67,7 +80,7 @@ struct sched_class {
     void (*scheduler_destroy)(struct scheduler *sched);
     void (*scheduler_start)(struct scheduler *sched);
     void (*enqueue_task) (struct scheduler *sched, struct task_struct *tasks, int num_tasks);
-    struct task_struct *(*pick_next_task)(struct scheduler *sched, struct task_struct *prev);
+    struct task_struct *(*pick_next_task)(struct scheduler *sched);
     void (*task_fork)(struct task_struct *p);
     void (*task_dead)(struct task_struct *p);
     void (*wake_up_scheduler)(struct scheduler *sched);
@@ -95,5 +108,11 @@ void run_scheduler();
 
 int init_scheduler(struct scheduler *sched, struct sched_class *sched_class, int cpu, struct task_struct *tasks, int task_num);
 void deinit_scheduler(struct scheduler *sched);
+
+struct task_struct *create_task(struct task_info *info, task_function func);
+void resume_task(struct task_struct *task);
+void destroy_task(struct task_struct *task);
+
+#define MS_TO_NS(MS) ((MS) * 1000000)
 
 #endif
