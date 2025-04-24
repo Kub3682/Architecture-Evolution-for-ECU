@@ -56,15 +56,15 @@ int init_scheduler(struct scheduler *sched, struct sched_class *sched_class, int
     sched->current_task = NULL;
     sched->sched_class = sched_class;
 
-    // 初始化控制任务线程的条件变量
-    pthread_mutex_init(&sched->mutex, NULL);
-    pthread_cond_init(&sched->cond_var, NULL);
+    for(int i = 0; i < task_num; i++) {
+        tasks[i].sched = sched;
+    }
 
     // 创建调度器线程 TODO 设置pthread的亲、RT和优先级属性
     int ret = pthread_create(&sched->tid, NULL, scheduler_tick, (void *)sched);
     if(ret != 0) {
         printf("Create scheduler thread fail!\n");
-        goto create_thread_fail;
+        return RET_FAIL;
     }
 
     struct sched_param scheduler_tick_param;
@@ -72,19 +72,11 @@ int init_scheduler(struct scheduler *sched, struct sched_class *sched_class, int
     pthread_setschedparam(sched->tid, SCHED_FIFO, &scheduler_tick_param);
 
     return RET_SUCCESS;
-
-create_thread_fail:
-    pthread_mutex_destroy(&sched->mutex);
-    pthread_cond_destroy(&sched->cond_var);
-
-    return RET_FAIL;
 }
 
 void deinit_scheduler(struct scheduler *sched)
 {
     pthread_join(sched->tid, NULL);
-    pthread_mutex_destroy(&sched->mutex);
-    pthread_cond_destroy(&sched->cond_var);
 }
 
 int create_scheduler(int cpu, enum schedule_strategy_t sched_strategy, struct task_struct *tasks, int task_num)
@@ -132,24 +124,24 @@ void run_scheduler()
     }
 }
 
-static void wait_wake_up(struct task_struct *task)
+static void task_wait_resume(struct task_struct *task)
 {
-    pthread_mutex_lock(&task->sched->mutex);
+    pthread_mutex_lock(&task->mutex);
         
     // 如果任务当前没有运行，则等待调度器唤醒
     while(task->task_state != RUNNING) {
-        pthread_cond_wait(&task->sched->cond_var, &task->sched->mutex);
+        pthread_cond_wait(&task->cond_var, &task->mutex);
     }
 
-    pthread_mutex_unlock(&task->sched->mutex);
+    pthread_mutex_unlock(&task->mutex);
 }
 
 static void terminate(struct task_struct *task)
 {
-    pthread_mutex_lock(&task->sched->mutex);
+    pthread_mutex_lock(&task->mutex);
     task->task_state = SUSPENDED;
-    pthread_cond_signal(&task->sched->cond_var);
-    pthread_mutex_unlock(&task->sched->mutex);
+    pthread_cond_signal(&task->cond_var);
+    pthread_mutex_unlock(&task->mutex);
     task->sched->sched_class->wake_up_scheduler(task->sched);
 }
 
@@ -159,8 +151,8 @@ static void *periodic_task(void *args)
     bind_cpu(task->cpu);
 
     while(1) {
-        wait_wake_up(task);
-        task->task_function();
+        task_wait_resume(task);
+        task->pfunc();
         terminate(task);
     }
 
@@ -171,8 +163,8 @@ static void *single_shot_task(void *args)
 {
     struct task_struct *task = (struct task_struct *)args;
     bind_cpu(task->cpu);
-    wait_wake_up(task);
-    task->task_function();
+    task_wait_resume(task);
+    task->pfunc();
     terminate(task);
 
     return NULL;
@@ -185,9 +177,22 @@ struct task_struct *create_task_struct()
     return task;
 }
 
-void create_task(struct task_struct *task)
-{   
+struct task_struct *create_task(struct task_info *info, task_function func)
+{
+    struct task_struct *task = (struct task_struct *)malloc(sizeof(struct task_struct));
     if(task) {
+        task->priority = info->priority;
+        task->cpu = info->cpu;
+        task->period = info->period;
+        task->is_preempted = 0;
+        task->table_id = info->table_id;
+        task->task_type = info->task_type;
+        task->task_state = SUSPENDED;
+        task->pfunc = func;
+
+        pthread_mutex_init(&task->mutex, NULL);
+        pthread_cond_init(&task->cond_var, NULL);
+
         switch(task->task_type) {
             case BASIC_PERIODIC:
                 pthread_create(&task->tid, NULL, periodic_task, (void *)task);
@@ -213,17 +218,27 @@ void create_task(struct task_struct *task)
 
                 break;
         }
-        
     }
+
+    return task;
 }
 
 void destroy_task(struct task_struct *task)
 {
     if(task) {
         pthread_join(task->tid, NULL);
+        pthread_mutex_destroy(&task->mutex);
+        pthread_cond_destroy(&task->cond_var);
         free(task);
     }
         
 }
 
-
+void resume_task(struct task_struct *task)
+{
+    if(task) {
+        pthread_mutex_lock(&task->mutex);
+        pthread_cond_signal(&task->cond_var);
+        pthread_mutex_unlock(&task->mutex);
+    }
+}
