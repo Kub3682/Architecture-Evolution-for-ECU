@@ -1,84 +1,55 @@
-### 软件架构设计
-本项目围绕 **AUTOSAR Classic Platform 的任务调度模型** 构建，用于仿真AUTOSAR Classic Platform中任务调度和任务执行流程。
+# 软件架构设计
 
-- 
+## Overview
+本项目围绕 **AUTOSAR Classic Platform 的任务调度模型** 构建，用于仿真AUTOSAR Classic Platform中任务调度和任务执行流程。项目采用模块化设计，其核心逻辑主要由四个关键模块组成：
 
-根据上述逻辑，本项采用模块化设计，其核心逻辑由四个关键模块组成：
+- ✅ 任务模块（Task）
+- ✅ 抽象调度器模块（Abstract Scheduler）
+- ✅ 表调度器模块（Table Scheduler）
+- ✅ 用户接口模块（User Interface）
 
-本小节将讨论任务管理的软件架构设计，它会基于现有AUTOSAR Classic Platform标准，但是，作为仿真器的核心组件，它必须面向通用OS进行扩展设计。首先，对其关键组件的功能以及它们之间的关系进行设计：
+## 模块简介
 
-- 任务管理方法（调度方法）：主要实现任务活动、任务状态、优先级、资源、中断、错误等执行行为。这些行为会根据具体操作系统遵循的规则、所选择的调度策略发生变化。例如，AUTOSAR OS要求设计时静态配置任务，不会在运行时创建新任务，它不会直接向用户或者其他操作系统模块提供诸如fork或者CreateTask类似的函数或方法。相反，很多通用操作系统或者支持动态创建任务的RTOS均提供这类方法。另外，不同调度策略对调度函数的具体函数也不尽相同。因此，需要划分任务管理方法中的不变量和变量，以应对不同更为广泛的情况和需求变化。具体划分为：
-  + 不变量：任务管理方法向外提供的基本功能是不变的。尽管不同OS所支持的任务行为种类不尽相同（或向外的函数名不同）或者底层实现方法不同，但是这些行为通常是互为子集关系且大部分向外部提供的功能表现是基本一致的。
-  + 变量：具体功能数量和底层实现逻辑
-根据上述分析，可利用“接口隔离”原则，实现这些不变量与变量的分离：
-  + 抽象的任务管理接口：设计抽象接口，该接口是任务管理行为各行为的超集。接口用于用户和OS的外部调用。
-  + 具体的任务管理方法：根据自身OS、调度方法设计具体的任务管理方法，然后绑定给接口调用。
+### 1. 任务模块（Task）
 
-- 支持任务管理的结构（调度器结构）：主要为任务管理方法提供数据结构支持。该部分同样存在公共的不变量，例如调度器所依赖的时钟、调度器所在核心等。也同样存在变量，具体调度方法实现所用的数据结构，例如，表调度、FIFO、RR所使用的列表（或队列），完全公平调度用到的红黑树等。这里可以考虑利用组合或继承进行实现。
+* 描述任务的基本属性，如周期、偏移、类型（周期/单发）、优先级等
+* 支持任务调度状态更新（激活/运行/完成）
+* 可扩展为支持资源依赖、事件触发等高级模型
 
-- 管理对象（任务）：任务结构实际上也会根据OS的情况存在具体差异，但是对于设计模拟器来说是基本不变的，因此，这里不做过多抽象隔离设计。
+### 2. 抽象调度器模块（AbstractScheduler）
+抽象调度器模块用于处理任务管理中的不变量，一方面为上层的软件提供统一的调度方法接口定义，另一方面用于描述任务调度的行为。具体作用如下：
 
-总之，如图3所示，其基本关系可以确定为：
-- 具体任务管理方法与具体管理结构、管理对象对应，但依赖的是抽象。
-- 抽象任务管理方法与抽象管理结构、管理对象对应。
-- 外部调用抽象任务管理方法
+* 作为所有调度器的基类，定义统一的调度接口
+* 提供调度器生命周期管理（初始化、启动、终止）
+* 保持调度器（不同调度算法的调度器）之间的可替换性
+
+### 3. 表调度器模块（TableScheduler）
+符合AUTOSAR Classic 平台规定的调度器实现，具体特性为：
+
+* 实现时间驱动调度（Time-Triggered Scheduling）
+
+* 支持多个调度表的管理、切换与执行
+
+* 每个调度表包括一系列任务启动事件（时间戳 -> 任务）
+
+###  4. 用户接口模块（UI/CLI）
+仿真器的用户接口，提供UI界面或者CLI方式启动仿真，具体特性为：
+
+* 加载任务与调度表配置（如 ARXML或其他格式）
+* 提供命令行入口或图形界面入口
+* 控制调度过程（如执行步进、重置仿真、导出调度结果）
+* 提供调度结果的图形和数据输出
+* 提供对输出结果的分析
+
+## 模块间的交互示意
+图1展示了软件模块之间的关系。
+
+* 用户接口模块：仅与抽象调度器模块交互。通过调用由抽象调度器模块提供的接口实现用户仿真功能。
+* 抽象调度器模块：向上为用户接口模块提供任务管理相关接口，向下定义调度器属性和行为的通用抽象。采用调度器和调度方法的分离设计，其中调度器类定义描述通用调度器的属性，调度方法类定义统一任务管理行为和接口。调度方法会依赖（Dependency）于调度器类。
+* 具体调度器模块：调度器的具体实现。具体调度器类定义相关调度器实现的属性描述，除去定义特殊属性还会通过组合（Composition）抽象调度器获取通用属性。具体调度方法类用于实现具体调度器的相关方法，是通用调度器方法的具体实现（implements）。具体调度方法通过抽象调度方法调用具体调度器类。
+* 任务模块：主要定义任务的属性和任务执行相关的方法。其中描述任务的task_struct会被调度方法类所依赖（Dependency）。
 
 <div align="center">
-    <img src="img/taskmanagement_software_arch.jpg" alt="任务管理软件结构" width="100%"/>
-    <div>图3 任务管理软件架构</div>
+    <img src="../img/taskmanagement_software_arch.jpg" alt="任务管理软件结构" width="100%"/>
+    <div>图1 软件模块以及模块内部关键类之间的关系</div>
 </div>
-
-大致伪代码实现如下：
-
-```
-// sched.c/h
-struct task_struct {
-  int id;
-  void (*task_function)(void);
-  ...
-};
-
-
-struct scheduler {
-  int timefd;
-  struct task_struct *current_task;
-  ...
-};
-
-struct sched_function {
-  void (*create_task)(struct task_struct *task);
-  void (*activate_task)(struct scheduler *sched);
-  ...
-};
-
-scheduler *global_scheduler;
-
-// table_scheduler.c/h
-
-struct table_scheduler {
-  struct scheduler sched;
-  int duration;
-  struct EntryPoint ep[MAX_NUM_EP];
-  ...
-};
-
-struct table_scheduler scheduler;
-
-void regist_scheduler()
-{
-  global_scheduler = &scheduler.sched;
-}
-
-void table_activate_task(struct scheduler *sched) {
-  table_scheduler *table_sched = ‌container_of(sched, struct scheduler, sched);
-  ...
-  table_activate(table_sched);
-}
-
-struct sched_function table_sched_function = {
-  .activate_task = table_activate_task,
-  .create_task = NULL,
-  ...
-}
-
-```
