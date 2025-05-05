@@ -129,9 +129,11 @@ static void task_wait_resume(struct task_struct *task)
     pthread_mutex_lock(&task->mutex);
         
     // 如果任务当前没有运行，则等待调度器唤醒
-    while(task->task_state != RUNNING) {
+    while(task->task_state != RESUMING) {
         pthread_cond_wait(&task->cond_var, &task->mutex);
     }
+
+    task->task_state = RUNNING;
 
     pthread_mutex_unlock(&task->mutex);
 }
@@ -142,6 +144,7 @@ static void terminate(struct task_struct *task)
     task->task_state = SUSPENDED;
     pthread_cond_signal(&task->cond_var);
     pthread_mutex_unlock(&task->mutex);
+    printf("Task: %p will wakeup scheduler\n", task);
     task->sched->sched_class->wake_up_scheduler(task->sched);
 }
 
@@ -152,6 +155,7 @@ static void *periodic_task(void *args)
 
     while(1) {
         task_wait_resume(task);
+        printf("task %p will executing\n", task);
         task->pfunc();
         terminate(task);
     }
@@ -163,6 +167,7 @@ static void *single_shot_task(void *args)
 {
     struct task_struct *task = (struct task_struct *)args;
     bind_cpu(task->cpu);
+
     task_wait_resume(task);
     task->pfunc();
     terminate(task);
@@ -177,7 +182,7 @@ struct task_struct *create_task_struct()
     return task;
 }
 
-struct task_struct *create_task(struct task_info *info, task_function func)
+struct task_struct *create_task(struct task_struct_info *info, task_function func)
 {
     struct task_struct *task = (struct task_struct *)malloc(sizeof(struct task_struct));
     if(task) {
@@ -230,15 +235,94 @@ void destroy_task(struct task_struct *task)
         pthread_mutex_destroy(&task->mutex);
         pthread_cond_destroy(&task->cond_var);
         free(task);
+    }      
+}
+
+void create_tasks(struct task_struct *tasks, struct task_struct_info *task_struct_infos, int num_tasks)
+{
+    for(int i = 0; i < num_tasks; i++) {
+        struct task_struct *task = &tasks[i];
+        struct task_struct_info *info = &task_struct_infos[i];
+        task->priority = info->priority;
+        task->cpu = info->cpu;
+        task->period = info->period;
+        task->is_preempted = 0;
+        task->table_id = info->table_id;
+        task->task_type = info->task_type;
+        task->task_state = SUSPENDED;
+        task->pfunc = info->pfunc;
+
+        pthread_mutex_init(&task->mutex, NULL);
+        pthread_cond_init(&task->cond_var, NULL);
+        printf("task[%d]:%p, period: %d, priority: %d, type: %d\n", i, task, task->period, task->priority, task->task_type);
+
+        switch(task->task_type) {
+            case BASIC_PERIODIC:
+                pthread_create(&task->tid, NULL, periodic_task, (void *)task);
+                break;
+            
+            case BASIC_SINGLE_SHOT:
+                pthread_create(&task->tid, NULL, single_shot_task, (void *)task);
+                break;
+
+            case EXTENDED_PERIODIC:
+                // TODO
+                break;
+
+            case EXTENDED_SINGLE_SHOT:
+
+                break;
+
+            case ISR:
+
+                break;
+
+            default:
+
+                break;
+        }
     }
-        
+}
+
+void destroy_tasks(struct task_struct *tasks, int num_task)
+{
+    for(int i = 0; i < num_task; i++) {
+        struct task_struct *task = &tasks[i];
+        pthread_join(task->tid, NULL);
+        pthread_mutex_destroy(&task->mutex);
+        pthread_cond_destroy(&task->cond_var);   
+    }
 }
 
 void resume_task(struct task_struct *task)
 {
     if(task) {
+        printf("Will resum task: %p\n", task);
         pthread_mutex_lock(&task->mutex);
         pthread_cond_signal(&task->cond_var);
         pthread_mutex_unlock(&task->mutex);
+    }
+}
+
+void resume_preempted_task(struct task_struct *task)
+{
+    if(task) {
+        task->task_state = task->task_old_state;
+        printf("Will resum preempted task: %p, state: %d\n", task, task->task_state);
+
+        if(task->task_state == RESUMING && pthread_mutex_trylock(&task->mutex) == 0) {
+            // 表明任务在收到信号前就被抢占，需要再发一次信号
+            pthread_cond_signal(&task->cond_var);
+            pthread_mutex_unlock(&task->mutex);
+            printf("aaa\n");
+        }
+
+        if(task->task_state == SUSPENDED && pthread_mutex_trylock(&task->mutex) == 0) {
+            pthread_mutex_unlock(&task->mutex);
+            task->sched->sched_class->wake_up_scheduler(task->sched);
+            printf("bbb\n");
+        }
+            
+        // 退出，交由OS调度器来恢复任务 
     }
 }

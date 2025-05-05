@@ -26,6 +26,7 @@ enum task_state_t {
     SUSPENDED,
     READY,
     RUNNING,
+    RESUMING,
     WAITING,
 };
 
@@ -38,12 +39,13 @@ enum schedule_strategy_t {
 
 typedef void (*task_function)(void);
 
-struct task_info {
+struct task_struct_info {
     int priority;
     int cpu;
     int period;
     int table_id;
     enum task_type_t task_type;
+    task_function pfunc;
 };
 
 struct task_struct {
@@ -55,6 +57,7 @@ struct task_struct {
     int table_id;
     enum task_type_t task_type;
     enum task_state_t task_state;
+    enum task_state_t task_old_state;
     pthread_mutex_t mutex;
     pthread_cond_t cond_var;
     struct list_head list;
@@ -95,7 +98,7 @@ static inline int bind_cpu(int cpu)
     CPU_SET(cpu, &cpuset);
 
     if(pthread_setaffinity_np(tid, sizeof(cpuset), &cpuset) != 0) {
-        printf("Thread %d bind cpu %d error!\n", tid, cpu);
+        printf("Thread %ld bind cpu %d error!\n", tid, cpu);
         return RET_FAIL;
     }
 
@@ -109,9 +112,12 @@ void run_scheduler();
 int init_scheduler(struct scheduler *sched, struct sched_class *sched_class, int cpu, struct task_struct *tasks, int task_num);
 void deinit_scheduler(struct scheduler *sched);
 
-struct task_struct *create_task(struct task_info *info, task_function func);
+struct task_struct *create_task(struct task_struct_info *info, task_function func);
 void resume_task(struct task_struct *task);
+void resume_preempted_task(struct task_struct *task);
 void destroy_task(struct task_struct *task);
+void create_tasks(struct task_struct *tasks, struct task_struct_info *task_struct_infos, int num_tasks);
+void destroy_tasks(struct task_struct *tasks, int num_task);
 
 #define MS_TO_NS(MS) ((MS) * 1000000)
 
