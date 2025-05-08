@@ -26,6 +26,9 @@
 
 #define LCM(a,b) (((a)*(b))/GCD(a,b))
 
+struct timespec process_start = {0,0}, process_stop;
+long long process_elapse;
+
 static inline int is_mutex_free(pthread_mutex_t *mutex) {
     int ret = pthread_mutex_trylock(mutex);
     if (ret == 0) {
@@ -75,9 +78,8 @@ static inline void task_enqueue_check(struct list_head *queue, struct task_struc
 
     list_for_each_entry(task, queue, list) {
         if(new_task == task) {
-            //printf("Exceeding the deadline!\n");
-            //exit(-1);
-            return;
+            printf("Exceeding the task %p deadline, period: %d, priority: %d\n", task, task->period, task->priority);
+            exit(-1);
         }
 
         if(new_task->priority < task->priority) {
@@ -179,7 +181,7 @@ static void process_tick(struct event_func_args_t *args)
     struct scheduler *sched = &args->scheduler->sched;
     struct schedule_table *table = args->scheduler->tables[args->event_index];
     const struct timespec *fix_start = (const struct timespec *)args->user_data;
-
+    printf("process_tick begin\n");
     // 将到期点中的任务插入就绪队列
     table_scheduler_enqueue(sched, table);
 //    print_ready_queue(&sched->ready_queue);
@@ -192,8 +194,10 @@ static void process_tick(struct event_func_args_t *args)
             sched->current_task->task_old_state = sched->current_task->task_state;
             sched->current_task->task_state = READY;
         }
+
+        // 存在一种可能，刚结束task_event_process，任务还没开始执行，就触发了时钟中断
+        // 此时sched->current_task并非NULL，但是，也不是被打断的
         task_enqueue_check(&sched->ready_queue, sched->current_task);
-//        print_ready_queue(&sched->ready_queue);
     }
 
     // 任务选择
@@ -215,7 +219,7 @@ static void process_tick(struct event_func_args_t *args)
 
     // 更新时钟
     table_scheuler_update_timer(table, fix_start);
-
+    clock_gettime(CLOCK_MONOTONIC, &process_start);
 //    task->sched->sched_class->wake_up_scheduler(task->sched);
 }
 
@@ -226,7 +230,7 @@ static void process_task_event(struct event_func_args_t *args)
 
     // 处理由task主动让出CPU
     struct scheduler *sched = &args->scheduler->sched;
-    print_ready_queue(&sched->ready_queue);
+//    print_ready_queue(&sched->ready_queue);
     sched->current_task = sched->sched_class->pick_next_task(sched);
     if(sched->current_task) {
         printf("process_task_event task: %p, period: %d, priority: %d\n", sched->current_task, sched->current_task->period, sched->current_task->priority);
@@ -234,16 +238,25 @@ static void process_task_event(struct event_func_args_t *args)
             // 任务并非被抢占的，说明是被条件变量阻塞的
             sched->current_task->task_state = RESUMING;
             resume_task(sched->current_task);
+
+            clock_gettime(CLOCK_MONOTONIC, &stop);
+            long long elapse = stop.tv_nsec - start.tv_nsec + (stop.tv_sec-start.tv_sec) * 1000000000;
+            printf("process_task_event not preempted routine elapse: %lld ns\n", elapse);
         } else {
             // 任务是被抢占的
             sched->current_task->is_preempted = 0;
             resume_preempted_task(sched->current_task);
+            
+            clock_gettime(CLOCK_MONOTONIC, &stop);
+            long long elapse = stop.tv_nsec - start.tv_nsec + (stop.tv_sec-start.tv_sec) * 1000000000;
+            printf("process_task_event preempted routine elapse: %lld ns\n", elapse);
         } 
 //        sched->sched_class->wake_up_scheduler(sched->current_task->sched);
     }
-    clock_gettime(CLOCK_MONOTONIC, &stop);
-    long long elapse = stop.tv_nsec - start.tv_nsec + (stop.tv_sec-start.tv_sec) * 1000000000;
-    printf("process_task_event elapse: %lld ns\n", elapse);
+
+    clock_gettime(CLOCK_MONOTONIC, &process_stop);
+    process_elapse = process_stop.tv_nsec - process_start.tv_nsec + (process_stop.tv_sec-process_start.tv_sec) * 1000000000;
+    printf("task and schedule total elapse: %lld\n", process_elapse);
 }
 
 static void process_isr_event(struct event_func_args_t *args)
@@ -500,29 +513,32 @@ static struct scheduler *table_scheduler_create(struct sched_class *sched_class,
     struct table_scheduler *table_scheduler = (struct table_scheduler *)malloc(sizeof(struct table_scheduler));
     struct scheduler *sched = &table_scheduler->sched;
     
+    // 初始化调度器（通用）
+    init_scheduler(sched, sched_class, cpu, tasks, task_num);
+
     // 根据任务初始化调度表
-    table_scheduler_init(table_scheduler, tasks, task_num);
+    table_scheduler_init(table_scheduler, sched->tasks, sched->task_num);
     
     // 创建调度器的epoll
     int ret = table_scheduler_create_epoll(table_scheduler);
     if(ret == -1) {
         goto create_epoll_fail;
     }
-
-    // 初始化调度器（通用）
-    if(init_scheduler(sched, sched_class, cpu, tasks, task_num) == RET_FAIL) {
-        printf("Init scheduler fail!\n");
-        goto init_scheduler_fail;
+    
+    if(create_scheduler_threads(sched) == RET_FAIL) {
+        printf("Create scheduler thread fail!\n");
+        goto create_scheduler_threads_fail;
     }
     
     return (struct scheduler *)table_scheduler;
 
     //失败后的资源销毁
-init_scheduler_fail:
+create_scheduler_threads_fail:
     table_scheduler_destroy_epoll(table_scheduler);
 
 create_epoll_fail:
     table_scheduler_deinit(table_scheduler);
+    deinit_scheduler(sched);
     free(table_scheduler);
     return NULL;
 }
@@ -530,6 +546,8 @@ create_epoll_fail:
 static void table_scheduler_destroy(struct scheduler *sched)
 {
     struct table_scheduler *table_scheduler = container_of(sched, struct table_scheduler, sched);
+
+    join_scheduler_threads(sched);
 
     deinit_scheduler(sched);
 
@@ -560,9 +578,11 @@ static void table_scheduler_schedule(struct scheduler *sched)
     int num_events = table_sched->num_events;  
 
     struct epoll_event events[num_events];
-    printf("scheduler on cpu: %d\n", sched->cpu);
+    
     int n = epoll_wait(table_sched->epoll_fd, events, num_events, -1);
     
+    printf("scheduler on cpu: %d, the number of events to respond to is %d\n", sched->cpu, n);
+
     struct timespec fix_start;
     clock_gettime(CLOCK_MONOTONIC, &fix_start);
 
