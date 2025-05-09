@@ -316,7 +316,7 @@ static void table_scheduler_init(struct table_scheduler *table_scheduler, struct
         }
 
         // 构建到期点哈希表，并将该到期点的任务放入到期点哈希表
-        for(int time = 1; time < duration[i]; time++) {
+        for(int time = 0; time < duration[i]; time++) {
             for(int j = 0; j < table_task_num[i]; j++) {
                 struct task_struct *task = table_task_array[i][j];
                 if(time % task->period == 0) {

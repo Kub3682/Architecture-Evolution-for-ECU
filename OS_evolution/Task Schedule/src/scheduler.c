@@ -181,6 +181,7 @@ static void terminate(struct task_struct *task)
     pthread_cond_signal(&task->cond_var);
     pthread_mutex_unlock(&task->mutex);
     printf("Task: %p will wakeup scheduler\n", task);
+//    task->sched->current_task = NULL;
     task->sched->sched_class->wake_up_scheduler(task->sched);
 }
 

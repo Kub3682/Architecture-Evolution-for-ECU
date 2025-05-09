@@ -2,10 +2,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-// int period_arr[] = {10,50,100,500,1000,10000};
-int period_arr[] = {1,5,10,100,1000};
+//int period_arr[] = {10,50,100,500,1000,10000};
+int period_arr[] = {1};
 int period_arr_len = sizeof(period_arr)/sizeof(int);
-int cpu_arr[] = {8};
+int cpu_arr[] = {0};
 int cpu_arr_len = sizeof(cpu_arr)/sizeof(int);
 
 static void test_task()
@@ -43,9 +43,11 @@ static void user_destroy_tasksinfo(struct task_struct_info *tasks_info)
 
 int main(int argc, char **argv)
 {
-    struct task_struct_info *info_arr = user_create_tasksinfo_random(0, 10);
+    int num_task = 1;
+    int cpu = 0;
+    struct task_struct_info *info_arr = user_create_tasksinfo_random(cpu, num_task);
 
-    create_simulator(info_arr, 10, TABLE);
+    create_simulator(info_arr, num_task, TABLE);
 
     run_simulator();
     
