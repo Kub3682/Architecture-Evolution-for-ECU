@@ -7,96 +7,125 @@
 #include <sched.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <ucontext.h>
+#include <stdatomic.h>
 
 #define RET_SUCCESS  0
 #define RET_FAIL -1
 
+#define FALSE 0
+#define TRUE 1
+
 #define MAX_NUM_CPU     256
 
-struct sched_class;
-struct scheduler;
+#define SCHEDULE_MAX_PRIORITY   99
+#define SCHEDULE_TIMING_PRIORITY 90
+#define SCHEDULER_PRIORITY   50
+
+#define STACK_SIZE 8192
+
+#define MS_TO_NS(MS) ((MS) * 1000000)
 
 enum task_state_t {
-    INIT,
-    SUSPENDED,
-    READY,
-    RUNNING,
-    RESUMING,
-    WAITING,
+    TASK_INIT,
+    TASK_SUSPENDED,
+    TASK_READY,
+    TASK_RUNNING,
+    TASK_RESUMING,
+    TASK_WAITING,
 };
 
+enum sched_state_t {
+    SCHED_INIT,
+    SCHED_SUSPENDED,
+    SCHED_RESUMING,
+    SCHED_RUNNING,
+    SCHED_WAITING,
+};
+
+struct scheduler;
+
 struct task_struct {
-    pthread_t tid;
+    ucontext_t  ctx;
     int priority;
     int cpu;
     int period;
-    int is_preempted;
     int table_id;
+    int in_ready_queue;
     enum task_type_t task_type;
     enum task_state_t task_state;
-    enum task_state_t task_old_state;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond_var;
+//    pthread_mutex_t task_mutex;
     struct list_head list;
     struct scheduler *sched;
     task_function pfunc;
-};
+    char *stack_ptr;
+    int stack_size;
+}__attribute__((aligned(64)));
 
 struct scheduler {
     int cpu;
-    pthread_t tid;
     int task_num;
-    int arrived_task_num;
-    struct list_head ready_queue;
     struct task_struct *current_task;
     struct sched_class	*sched_class;
     struct task_struct *tasks;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
+
+    pthread_t timing_tid;
+    pthread_t scheduler_tid;
+
+    ucontext_t  scheduler_ctx;
+    _Atomic enum sched_state_t state;
+    atomic_bool timing_arrived;
+    
+    struct list_head ready_queue;
+
+    pthread_mutex_t scheduler_mutex;
+    pthread_cond_t scheduler_init_cond;
+    pthread_cond_t scheduler_resume_cond;
+    sigset_t block_set;
+    sigset_t prev_set;
 }; 
 
 struct sched_class {
     struct scheduler* (*scheduler_create)(struct sched_class *sched_class, int cpu, struct task_struct *tasks, int task_num);
     void (*scheduler_destroy)(struct scheduler *sched);
     void (*scheduler_start)(struct scheduler *sched);
-    void (*enqueue_task) (struct scheduler *sched, struct task_struct *tasks, int num_tasks);
+    void (*enqueue)(struct scheduler *sched);
+    void (*enqueue_task) (struct scheduler *sched, struct task_struct *task);
     struct task_struct *(*pick_next_task)(struct scheduler *sched);
     void (*task_fork)(struct task_struct *p);
     void (*task_dead)(struct task_struct *p);
     void (*wake_up_scheduler)(struct scheduler *sched);
     void (*schedule)(struct scheduler *sched);
+    void (*yield)(struct scheduler *sched);
 };
 
-static inline int bind_cpu(int cpu)
-{   
-    cpu_set_t cpuset;
-    pthread_t tid = pthread_self();
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu, &cpuset);
-
-    if(pthread_setaffinity_np(tid, sizeof(cpuset), &cpuset) != 0) {
-        printf("Thread %ld bind cpu %d error!\n", tid, cpu);
-        return RET_FAIL;
-    }
-
-    return RET_SUCCESS;
-}
-
+// scheduler functions
+void load_tasks(struct task_struct_info *task_info_arr, int num, struct task_struct *tasks_persched[], int *tasks_num_percpu);
 struct scheduler *create_scheduler(int cpu, enum schedule_strategy_t sched_strategy, struct task_struct *tasks, int task_num);
 void destroy_scheduler(struct scheduler *scheduler);
 void run_scheduler(struct scheduler *scheduler);
-
 void init_scheduler(struct scheduler *sched, struct sched_class *sched_class, int cpu, struct task_struct *tasks, int task_num);
-int create_scheduler_threads(struct scheduler *sched);
-void join_scheduler_threads(struct scheduler *sched);
 void deinit_scheduler(struct scheduler *sched);
+int scheduler_create_threads(struct scheduler *sched);
+void scheduler_join_threads(struct scheduler *sched);
 
-void load_tasks(struct task_struct_info *task_info_arr, int num, struct task_struct *tasks_persched[], int *tasks_num_percpu);
-void resume_task(struct task_struct *task);
-void resume_preempted_task(struct task_struct *task);
-void create_tasks(struct task_struct *tasks, int num_tasks);
-void destroy_tasks(struct task_struct *tasks, int num_task);
+void resume_scheduler_thread(struct scheduler *scheduler);
+void preempt_task(struct scheduler *scheduler);
 
-#define MS_TO_NS(MS) ((MS) * 1000000)
+static inline void print_ready_queue(struct list_head *queue)
+{
+    struct task_struct *pos;
+
+    list_for_each_entry(pos, queue, list) {
+        printf("task: %p, period: %d, priority: %d\n", pos, pos->period, pos->priority);
+    }
+}
+
+static inline void set_task_state(struct task_struct *task, enum task_state_t state)
+{
+//    phtread_mutex_lock(&task->mutex);
+    task->task_state = state;
+//    phtread_mutex_unlock(&task->mutex);
+}
 
 #endif

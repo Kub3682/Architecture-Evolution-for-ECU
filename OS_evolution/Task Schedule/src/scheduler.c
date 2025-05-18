@@ -3,27 +3,240 @@
 #include <sys/timerfd.h>
 #include <stdio.h>
 #include <signal.h>
+#include <unistd.h>
 
-#define SCHEDULER_PRIORITY 99
-#define TASK_PRIORITY   50
-
-static char scheduler_stop = 0;
+#define TASKS_THREAD_NUM    1
 
 extern struct sched_class table_sched_class;
-
-//static struct scheduler *schedulers[MAX_NUM_CPU] = {NULL};
-//static struct task_struct *tasks_persched[MAX_NUM_CPU] = {NULL};
-//static int tasks_num_percpu[MAX_NUM_CPU] = {0};
 struct sched_class *sched_class_arr[NUM_SCHED_STRATEGY] = {&table_sched_class, NULL, NULL};
 
-static void kill_tasks(struct scheduler* sched)
+static char scheduler_stop = 0;
+__thread struct scheduler *signal_sched = NULL;
+
+static void disable_timing_preempt(struct scheduler *sched)
 {
-    for(int i = 0; i < sched->task_num; i++) {
-        pthread_kill(sched->tasks[i].tid, SIGINT);
+    struct sched_param param;
+    param.sched_priority = SCHEDULE_MAX_PRIORITY;
+    pthread_setschedparam(sched->scheduler_tid, SCHED_FIFO, &param);
+
+    sigemptyset(&sched->block_set);
+    sigaddset(&sched->block_set, SIGUSR1);  
+    pthread_sigmask(SIG_BLOCK, &sched->block_set, &sched->prev_set);
+}
+
+static void enable_timing_preempt(struct scheduler *sched)
+{
+    struct sched_param param;
+    param.sched_priority = SCHEDULER_PRIORITY;
+    pthread_setschedparam(sched->scheduler_tid, SCHED_FIFO, &param);
+
+    pthread_sigmask(SIG_SETMASK, &sched->prev_set, NULL);
+}
+
+static inline void entry(struct task_struct *task)
+{
+    atomic_store(&task->sched->state, SCHED_WAITING);
+    task->task_state = TASK_RUNNING;
+    enable_timing_preempt(task->sched);
+}
+
+static inline void terminate(struct task_struct *task)
+{
+    disable_timing_preempt(task->sched);
+    task->task_state = TASK_SUSPENDED;
+    atomic_store(&task->sched->state, SCHED_RUNNING);         // 下桩，确保在任务执行时（该桩前）可被抢占（即执行信号函数中的swapcontext）
+    swapcontext(&task->ctx, &task->sched->scheduler_ctx);
+}
+
+static void periodic_task_entry(void *arg)
+{
+    struct task_struct *task = (struct task_struct *)arg;
+    while(1) {
+//        printf("task %p will excute, priority: %d, period: %d\n", task, task->priority, task->period);
+        entry(task);
+        task->pfunc();
+        terminate(task);
     }
 }
 
-static void *scheduler_tick(void *s)
+static void single_shot_task_entry(void *arg)
+{
+    struct task_struct *task = (struct task_struct *)arg;
+    entry(task);
+    task->pfunc();
+    terminate(task);
+}
+
+/*static inline void yield(struct scheduler *sched)
+{
+    swapcontext(&sched->current_task.ctx, &main_ctx);
+}*/
+
+static inline void init_task_ctx(struct task_struct *task)
+{
+    getcontext(&task->ctx);
+    task->ctx.uc_stack.ss_sp = task->stack_ptr;
+    task->ctx.uc_stack.ss_size = task->stack_size;
+    task->ctx.uc_link = &task->sched->scheduler_ctx;
+
+    switch(task->task_type) {
+        case BASIC_PERIODIC:
+            makecontext(&task->ctx,  (void (*)(void))periodic_task_entry, 1, task);
+            break;
+        
+        case BASIC_SINGLE_SHOT:
+            makecontext(&task->ctx,  (void (*)(void))single_shot_task_entry, 1, task);
+            break;
+
+        case EXTENDED_PERIODIC:
+            // TODO
+            break;
+
+        case EXTENDED_SINGLE_SHOT:
+
+            break;
+
+        case ISR:
+
+            break;
+
+        default:
+
+            break;
+    }
+    
+}
+
+static inline int bind_cpu(int cpu)
+{   
+    cpu_set_t cpuset;
+    pthread_t tid = pthread_self();
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu, &cpuset);
+
+    if(pthread_setaffinity_np(tid, sizeof(cpuset), &cpuset) != 0) {
+        printf("Thread %ld bind cpu %d error!\n", tid, cpu);
+        return RET_FAIL;
+    }
+
+    return RET_SUCCESS;
+}
+
+static void inline wait_scheduler_complete_init(struct scheduler *sched)
+{
+    pthread_mutex_lock(&sched->scheduler_mutex);
+    while (atomic_load(&sched->state) == SCHED_INIT) {
+        pthread_cond_wait(&sched->scheduler_init_cond, &sched->scheduler_mutex);
+    }
+    pthread_mutex_unlock(&sched->scheduler_mutex);
+}
+
+static void scheduler_wait_resume(struct scheduler *sched)
+{
+    pthread_mutex_lock(&sched->scheduler_mutex);
+
+/*    if(atomic_load(&sched->state) == SCHED_INIT) {
+        // sched->state = SUSPENDED;
+        atomic_store(&sched->state, SCHED_SUSPENDED);*/
+    if(atomic_exchange(&sched->state, SCHED_SUSPENDED) == SCHED_INIT) {
+        pthread_cond_signal(&sched->scheduler_init_cond);
+    }
+        
+    // 如果任务主线程当前没有运行，则等待调度器唤醒
+    while(atomic_load(&sched->state) != SCHED_RESUMING) {
+        pthread_cond_wait(&sched->scheduler_resume_cond, &sched->scheduler_mutex);
+    }
+
+    atomic_store(&sched->state, SCHED_RUNNING);
+
+    pthread_mutex_unlock(&sched->scheduler_mutex);
+}
+
+static inline void switch_to(struct scheduler *sched)
+{
+    struct task_struct *current_task = sched->current_task;
+//    current_task->task_state = TASK_RUNNING;
+    swapcontext(&sched->scheduler_ctx, &current_task->ctx);
+}
+
+static void interrupt_task(int sig)
+{
+//    signal_sched->current_task->task_state = READY;
+    if(atomic_load(&signal_sched->state) == SCHED_WAITING) {
+        disable_timing_preempt(signal_sched);
+        atomic_store(&signal_sched->state, SCHED_RUNNING);
+        swapcontext(&signal_sched->current_task->ctx, &signal_sched->scheduler_ctx);
+    }
+}
+
+static void *scheduler_thread(void *args)
+{
+    struct scheduler *sched = (struct scheduler *)args;
+    signal_sched = sched;
+
+    bind_cpu(sched->cpu);
+
+    /*初始化各任务的ctx*/
+    getcontext(&sched->scheduler_ctx);
+    for(int i = 0; i < sched->task_num; i++) {
+        init_task_ctx(&sched->tasks[i]);
+    }
+
+    /*装载中断task的信号*/
+    struct sigaction sa = {.sa_handler = interrupt_task, .sa_flags = SA_RESTART};
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
+    
+    while(1) {
+        scheduler_wait_resume(sched);
+
+        struct timespec start, stop;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        printf("begin excuting task:\n");
+        while(1) {
+            disable_timing_preempt(sched);
+            if(atomic_exchange(&sched->timing_arrived, FALSE)) {
+                struct timespec enqueue_start, enqueue_stop;
+                clock_gettime(CLOCK_MONOTONIC, &enqueue_start);
+                sched->sched_class->enqueue(sched);
+                if(sched->current_task && sched->current_task->task_state == TASK_RUNNING) {
+                    sched->current_task->task_state = TASK_READY; 
+                    sched->sched_class->enqueue_task(sched, sched->current_task);
+                }
+                clock_gettime(CLOCK_MONOTONIC, &enqueue_stop);
+                long long elapse = enqueue_stop.tv_nsec - enqueue_start.tv_nsec + (enqueue_stop.tv_sec-enqueue_start.tv_sec) * 1000000000;
+                printf("enqueue elapse: %lld ns\n", elapse);
+//                print_ready_queue(&sched->ready_queue);
+            }
+
+            sched->current_task = sched->sched_class->pick_next_task(sched);
+            if(sched->current_task) {
+                printf("Select task: %p, period: %d, priority: %d\n", sched->current_task, sched->current_task->period, sched->current_task->priority);
+//                print_ready_queue(&sched->ready_queue);                
+                switch_to(sched);
+                enable_timing_preempt(sched);
+            } else {
+                atomic_store(&sched->state, SCHED_SUSPENDED);
+                enable_timing_preempt(sched);
+                break;
+            }
+        }
+
+        
+        clock_gettime(CLOCK_MONOTONIC, &stop);
+        long long elapse = stop.tv_nsec - start.tv_nsec + (stop.tv_sec-start.tv_sec) * 1000000000;
+        printf("scheduler_thread elapse: %lld ns\n", elapse);
+    }
+
+    return NULL;
+}
+
+static void kill_scheduler(struct scheduler* sched)
+{  
+    pthread_kill(sched->scheduler_tid, SIGINT); 
+}
+
+static void *schedule_timing_thread(void *s)
 {
     struct scheduler *sched = (struct scheduler *)s;
     struct sched_class *sched_class = sched->sched_class;
@@ -37,179 +250,29 @@ static void *scheduler_tick(void *s)
     }
 
 ret:
-    kill_tasks(sched);
+    kill_scheduler(sched);
     return NULL;
 }
 
-static void inline wait_tasks_init(struct scheduler *sched)
+static inline int create_scheduler_thread(struct scheduler *sched)
 {
-    pthread_mutex_lock(&sched->mutex);
-    while (sched->arrived_task_num < sched->task_num) {
-        pthread_cond_wait(&sched->cond, &sched->mutex);
-    }
-    pthread_mutex_unlock(&sched->mutex);
-}
-
-void init_scheduler(struct scheduler *sched, struct sched_class *sched_class, int cpu, struct task_struct *tasks, int task_num)
-{
-    // 初始化成员变量
-    INIT_LIST_HEAD(&sched->ready_queue);
-    sched->tasks = tasks;
-    sched->task_num = task_num;
-    sched->arrived_task_num = 0;
-    sched->cpu = cpu;
-    sched->current_task = NULL;
-    sched->sched_class = sched_class;
-    pthread_mutex_init(&sched->mutex, NULL);
-    pthread_cond_init(&sched->cond, NULL);
-
-    for(int i = 0; i < sched->task_num; i++) {
-        sched->tasks[i].sched = sched;
-    }
-}
-
-int create_scheduler_threads(struct scheduler *sched)
-{
-    // 创建调度器线程 TODO 设置pthread的亲、RT和优先级属性
     pthread_attr_t attr;
-    struct sched_param scheduler_param;
+    struct sched_param task_param;
 
     pthread_attr_init(&attr);
     pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
 
-    scheduler_param.sched_priority = SCHEDULER_PRIORITY;  // 高于普通线程
-    pthread_attr_setschedparam(&attr, &scheduler_param);
+    task_param.sched_priority = SCHEDULER_PRIORITY;  // 高于普通线程
+    pthread_attr_setschedparam(&attr, &task_param);
 
     pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
 
-    int ret = pthread_create(&sched->tid, &attr, scheduler_tick, (void *)sched);
+    int ret = pthread_create(&sched->scheduler_tid, &attr, scheduler_thread, (void *)sched);
     if(ret != 0) {
-        printf("Create scheduler thread fail!\n");
         return RET_FAIL;
     }
-
-    create_tasks(sched->tasks, sched->task_num);
-    wait_tasks_init(sched);
 
     return RET_SUCCESS;
-}
-
-void join_scheduler_threads(struct scheduler *sched)
-{
-    pthread_join(sched->tid, NULL);
-
-    destroy_tasks(sched->tasks, sched->task_num);
-}
-
-void deinit_scheduler(struct scheduler *sched)
-{
-    pthread_mutex_destroy(&sched->mutex);
-    pthread_cond_destroy(&sched->cond);
-}
-
-struct scheduler *create_scheduler(int cpu, enum schedule_strategy_t sched_strategy, struct task_struct *tasks, int task_num)
-{
-/*  已由调用者保证  
-    if(cpu >= MAX_NUM_CPU || cpu < 0) {
-        printf("The cpu is not within the managed range\n");
-        return RET_FAIL;
-    }
-    
-    if(sched_strategy >= NUM_SCHED_STRATEGY || sched_strategy < TABLE) {
-        printf("Can not support the %d strategy\n", sched_strategy);
-        return RET_FAIL;
-    } */
-
-    struct scheduler *sched = NULL;
-    struct sched_class *sched_class = sched_class_arr[sched_strategy];
-    if(sched_class) {
-        sched = sched_class->scheduler_create(sched_class, cpu, tasks, task_num);
-        if(!sched) {
-            printf("Create schedulers fail!\n");
-            return NULL;
-        }
-    } else {
-        printf("Can not support the %d strategy\n", sched_strategy);
-        return NULL;
-    }
-
-    return sched;
-}
-
-void destroy_scheduler(struct scheduler *scheduler)
-{
-    // 由调用者保证scheduler的合法性
-    struct sched_class *sched_class = scheduler->sched_class;
-    sched_class->scheduler_destroy(scheduler);
-}
-
-void run_scheduler(struct scheduler *scheduler)
-{
-    // 由调用者保证scheduler的合法性
-    struct sched_class *sched_class = scheduler->sched_class;
-    sched_class->scheduler_start(scheduler);
-}
-
-static void task_wait_resume(struct task_struct *task)
-{
-    pthread_mutex_lock(&task->mutex);
-
-    if(task->task_state == INIT) {
-        pthread_mutex_lock(&task->sched->mutex);
-        task->sched->arrived_task_num++;
-        task->task_state = SUSPENDED;
-        if(task->sched->arrived_task_num == task->sched->task_num) {
-            pthread_cond_signal(&task->sched->cond);
-        }
-        pthread_mutex_unlock(&task->sched->mutex);
-    }
-        
-    // 如果任务当前没有运行，则等待调度器唤醒
-    while(task->task_state != RESUMING) {
-        pthread_cond_wait(&task->cond_var, &task->mutex);
-    }
-
-    task->task_state = RUNNING;
-
-    pthread_mutex_unlock(&task->mutex);
-}
-
-static void terminate(struct task_struct *task)
-{
-    pthread_mutex_lock(&task->mutex);
-    task->task_state = SUSPENDED;
-    pthread_cond_signal(&task->cond_var);
-    pthread_mutex_unlock(&task->mutex);
-    printf("Task: %p will wakeup scheduler\n", task);
-//    task->sched->current_task = NULL;
-    task->sched->sched_class->wake_up_scheduler(task->sched);
-}
-
-static void *periodic_task(void *args)
-{
-    struct task_struct *task = (struct task_struct *)args;
-    bind_cpu(task->cpu);
-
-    while(1) {
-        task_wait_resume(task);
-        printf("task %p will executing\n", task);
-        task->pfunc();
-        terminate(task);
-    }
-
-    return NULL;
-}
-
-static void *single_shot_task(void *args)
-{
-    struct task_struct *task = (struct task_struct *)args;
-    bind_cpu(task->cpu);
-
-    task_wait_resume(task);
-    task->pfunc();
-    terminate(task);
-
-    return NULL;
 }
 
 void load_tasks(struct task_struct_info *task_info_arr, int num, struct task_struct *tasks_persched[], int *tasks_num_percpu)
@@ -253,103 +316,147 @@ void load_tasks(struct task_struct_info *task_info_arr, int num, struct task_str
         task->priority = info->priority;
         task->cpu = info->cpu;
         task->period = info->period;
-        task->is_preempted = 0;
         task->table_id = info->table_id;
+        task->in_ready_queue = FALSE;
         task->task_type = info->task_type;
-        task->task_state = INIT;
+        task->task_state = TASK_INIT;
         task->pfunc = info->pfunc;
-
-        pthread_mutex_init(&task->mutex, NULL);
-        pthread_cond_init(&task->cond_var, NULL);
-
+        posix_memalign((void **)&task->stack_ptr, 16, STACK_SIZE);
+        task->stack_size = STACK_SIZE;
+        
         printf("task %p on CPU %d, period: %d, priority: %d, type: %d\n", task, cpu, task->period, task->priority, task->task_type);
     }
 
 }
 
-void create_tasks(struct task_struct *tasks, int num_tasks)
+void init_scheduler(struct scheduler *sched, struct sched_class *sched_class, int cpu, struct task_struct *tasks, int task_num)
+{
+    // 初始化成员变量
+    sched->state = ATOMIC_VAR_INIT(SCHED_INIT);
+    sched->timing_arrived = ATOMIC_VAR_INIT(FALSE);
+    INIT_LIST_HEAD(&sched->ready_queue);
+    sched->tasks = tasks;
+    sched->task_num = task_num;
+    sched->cpu = cpu;
+    sched->current_task = NULL;
+    sched->sched_class = sched_class;
+
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+
+    pthread_mutex_init(&sched->scheduler_mutex, &attr);
+    pthread_mutexattr_destroy(&attr);
+
+    pthread_cond_init(&sched->scheduler_init_cond, NULL);
+    pthread_cond_init(&sched->scheduler_resume_cond, NULL);
+
+    for(int i = 0; i < sched->task_num; i++) {
+        sched->tasks[i].sched = sched;
+    }
+}
+
+void deinit_scheduler(struct scheduler *sched)
+{
+    pthread_mutex_destroy(&sched->scheduler_mutex);
+    pthread_cond_destroy(&sched->scheduler_init_cond);
+    pthread_cond_destroy(&sched->scheduler_resume_cond);
+}
+
+//创建调度时机捕获线程
+int create_schedule_timing_thread(struct scheduler *sched)
 {
     pthread_attr_t attr;
-    struct sched_param task_param;
+    struct sched_param scheduler_param;
 
     pthread_attr_init(&attr);
     pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
 
-    task_param.sched_priority = TASK_PRIORITY;  // 高于普通线程
-    pthread_attr_setschedparam(&attr, &task_param);
+    scheduler_param.sched_priority = SCHEDULE_TIMING_PRIORITY;  // 高于调度器线程，触发抢占
+    pthread_attr_setschedparam(&attr, &scheduler_param);
 
     pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
 
-    for(int i = 0; i < num_tasks; i++) {
-        struct task_struct *task = &tasks[i];
-
-        switch(task->task_type) {
-            case BASIC_PERIODIC:
-                pthread_create(&task->tid, &attr, periodic_task, (void *)task);
-                break;
-            
-            case BASIC_SINGLE_SHOT:
-                pthread_create(&task->tid, &attr, single_shot_task, (void *)task);
-                break;
-
-            case EXTENDED_PERIODIC:
-                // TODO
-                break;
-
-            case EXTENDED_SINGLE_SHOT:
-
-                break;
-
-            case ISR:
-
-                break;
-
-            default:
-
-                break;
-        }
+    int ret = pthread_create(&sched->timing_tid, &attr, schedule_timing_thread, (void *)sched);
+    if(ret != 0) {
+        return RET_FAIL;
     }
+
+    return RET_SUCCESS;
 }
 
-void destroy_tasks(struct task_struct *tasks, int num_task)
+// 创建调度器中的线程
+int scheduler_create_threads(struct scheduler *sched)
 {
-    for(int i = 0; i < num_task; i++) {
-        struct task_struct *task = &tasks[i];
-        pthread_join(task->tid, NULL);
-        pthread_mutex_destroy(&task->mutex);
-        pthread_cond_destroy(&task->cond_var);   
+    int ret;
+    ret = create_schedule_timing_thread(sched);
+    if(ret != RET_SUCCESS) {
+        printf("Create schedule timing thread fail!\n");
+        exit(-1);
     }
+
+    ret = create_scheduler_thread(sched);
+    if(ret != RET_SUCCESS) {
+        printf("Create scheduler thread fail!\n");
+        exit(-1);
+    }
+
+    wait_scheduler_complete_init(sched);
+
+    return RET_SUCCESS;
 }
 
-void resume_task(struct task_struct *task)
+void scheduler_join_threads(struct scheduler *sched)
 {
-    if(task) {
-        printf("Will resum task: %p\n", task);
-        pthread_mutex_lock(&task->mutex);
-        pthread_cond_signal(&task->cond_var);
-        pthread_mutex_unlock(&task->mutex);
-    }
+    pthread_join(sched->scheduler_tid, NULL);
+    pthread_join(sched->timing_tid, NULL);
 }
 
-void resume_preempted_task(struct task_struct *task)
+struct scheduler *create_scheduler(int cpu, enum schedule_strategy_t sched_strategy, struct task_struct *tasks, int task_num)
 {
-    if(task) {
-        task->task_state = task->task_old_state;
-        printf("Will resum preempted task: %p, state: %d\n", task, task->task_state);
-
-        if(task->task_state == RESUMING && pthread_mutex_trylock(&task->mutex) == 0) {
-            // 表明任务在收到信号前就被抢占，需要再发一次信号
-            pthread_cond_signal(&task->cond_var);
-            pthread_mutex_unlock(&task->mutex);
-            printf("aaa\n");
+    // 由调用者保证参数的合法性
+    struct scheduler *sched = NULL;
+    struct sched_class *sched_class = sched_class_arr[sched_strategy];
+    if(sched_class) {
+        sched = sched_class->scheduler_create(sched_class, cpu, tasks, task_num);
+        if(!sched) {
+            printf("Create schedulers fail!\n");
+            return NULL;
         }
-
-        if(task->task_state == SUSPENDED && pthread_mutex_trylock(&task->mutex) == 0) {
-            pthread_mutex_unlock(&task->mutex);
-            task->sched->sched_class->wake_up_scheduler(task->sched);
-            printf("bbb\n");
-        }
-            
-        // 退出，交由OS调度器来恢复任务 
+    } else {
+        printf("Can not support the %d strategy\n", sched_strategy);
+        return NULL;
     }
+
+    return sched;
+}
+
+void destroy_scheduler(struct scheduler *scheduler)
+{
+    // 由调用者保证scheduler的合法性
+    struct sched_class *sched_class = scheduler->sched_class;
+    sched_class->scheduler_destroy(scheduler);
+}
+
+void run_scheduler(struct scheduler *scheduler)
+{
+    // 由调用者保证scheduler的合法性
+    struct sched_class *sched_class = scheduler->sched_class;
+    sched_class->scheduler_start(scheduler);
+}
+
+void resume_scheduler_thread(struct scheduler *scheduler)
+{
+    printf("Will resum scheduler thread: %ld\n", scheduler->scheduler_tid);
+    pthread_mutex_lock(&scheduler->scheduler_mutex);
+//    scheduler->state = RESUMING;
+    atomic_store(&scheduler->state, SCHED_RESUMING);
+    pthread_cond_signal(&scheduler->scheduler_resume_cond);
+    pthread_mutex_unlock(&scheduler->scheduler_mutex);
+}
+
+void preempt_task(struct scheduler *scheduler)
+{
+//    printf("Will resum preempted tasks main thread: %p, state: %d\n", scheduler->current_task, scheduler->current_task->task_state);
+    pthread_kill(scheduler->scheduler_tid, SIGUSR1);
 }
