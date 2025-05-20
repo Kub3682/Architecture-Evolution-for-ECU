@@ -348,12 +348,11 @@ static void process_tick(struct event_func_args_t *args)
     atomic_store(&sched->timing_arrived, TRUE);
 
     enum sched_state_t scheduler_state = atomic_load(&sched->state);
-    if(scheduler_state == SCHED_WAITING) {
-        preempt_task(sched);
-    } 
-    
+
     if(scheduler_state == SCHED_SUSPENDED) {
         resume_scheduler_thread(sched);
+    } else if(scheduler_state == SCHED_WAITING) {
+        preempt_task(sched);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &stop);

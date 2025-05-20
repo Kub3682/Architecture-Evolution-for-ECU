@@ -31,8 +31,6 @@ enum task_state_t {
     TASK_SUSPENDED,
     TASK_READY,
     TASK_RUNNING,
-    TASK_RESUMING,
-    TASK_WAITING,
 };
 
 enum sched_state_t {

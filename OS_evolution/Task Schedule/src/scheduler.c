@@ -164,6 +164,7 @@ static void interrupt_task(int sig)
 //    signal_sched->current_task->task_state = READY;
     if(atomic_load(&signal_sched->state) == SCHED_WAITING) {
         disable_timing_preempt(signal_sched);
+        printf("Will interrupt task %p\n", signal_sched->current_task);
         atomic_store(&signal_sched->state, SCHED_RUNNING);
         swapcontext(&signal_sched->current_task->ctx, &signal_sched->scheduler_ctx);
     }
@@ -214,10 +215,12 @@ static void *scheduler_thread(void *args)
                 printf("Select task: %p, period: %d, priority: %d\n", sched->current_task, sched->current_task->period, sched->current_task->priority);
 //                print_ready_queue(&sched->ready_queue);                
                 switch_to(sched);
+                printf("Back to scheduler_thread!\n");
                 enable_timing_preempt(sched);
             } else {
                 atomic_store(&sched->state, SCHED_SUSPENDED);
                 enable_timing_preempt(sched);
+                printf("End current epoch schedule!\n");
                 break;
             }
         }
@@ -457,6 +460,6 @@ void resume_scheduler_thread(struct scheduler *scheduler)
 
 void preempt_task(struct scheduler *scheduler)
 {
-//    printf("Will resum preempted tasks main thread: %p, state: %d\n", scheduler->current_task, scheduler->current_task->task_state);
+    printf("Will preempt_task: %p\n", scheduler->current_task);
     pthread_kill(scheduler->scheduler_tid, SIGUSR1);
 }
