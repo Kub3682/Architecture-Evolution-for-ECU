@@ -4,7 +4,7 @@
 #include "scheduler.h"
 #include <time.h>
 
-// 定义本地事件源
+// 定义本地事件源，主要为事件型任务和中断组成
 #define FOREACH_NATIVE_EVENT_SRC(e) \
     e(NATIVE_EVENT_TASK) \
     e(NATIVE_EVENT_ISR)  \
@@ -50,6 +50,7 @@ struct schedule_table {
     struct timespec start;
 #endif
     struct expiry_point *eps_array;
+    struct itimerspec new_timer;
 };
 
 struct table_scheduler {
@@ -57,6 +58,7 @@ struct table_scheduler {
     int num_schedule_table;
     int epoll_fd;
     int num_events;
+    int current_table_id;
     struct schedule_table **tables;
     int *event_fds;
     struct hlist_head event_hashtable[TABLE_SIZE];
